@@ -1,59 +1,66 @@
+﻿import threading
 import sqlite3
-from collections import Counter
-from scraper import DB_PATH
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
+from scraper import run_scraper, DB_PATH
+from analytics import compute_3digit_metrics
 
-def compute_3digit_metrics(limit=120):
+app = FastAPI(title="Kerala Lottery 3-Digit Analytics Platform")
+templates = Jinja2Templates(directory="templates")
+
+@app.on_event("startup")
+def startup_event():
+    # Run scraper in a background thread so the web server starts immediately without hanging
+    threading.Thread(target=run_scraper, daemon=True).start()
+
+@app.get("/", response_class=HTMLResponse)
+def dashboard(request: Request):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("""
-        SELECT last_three_first_prize, suffix_3digits 
-        FROM draws 
-        WHERE last_three_first_prize IS NOT NULL 
-        ORDER BY id DESC LIMIT ?
-    """, (limit,))
-    rows = cur.fetchall()
-    conn.close()
+    try:
+        cur.execute("SELECT draw_name, draw_code, draw_date, first_prize, last_three_first_prize FROM draws ORDER BY id DESC LIMIT 10")
+        recent_draws = cur.fetchall()
+    except Exception:
+        recent_draws = []
+    finally:
+        conn.close()
 
-    if not rows:
-        return None
-
-    # Collect 3-digit numbers from 1st prize endings
-    fp_trio_list = [r[0] for r in rows if r[0] and len(r[0]) == 3]
-
-    # Positional tracking: Hundreds (P1), Tens (P2), Units (P3)
-    p1_counts = Counter([num[0] for num in fp_trio_list])
-    p2_counts = Counter([num[1] for num in fp_trio_list])
-    p3_counts = Counter([num[2] for num in fp_trio_list])
-
-    # Top historical digits per position
-    top_p1 = [d for d, _ in p1_counts.most_common(3)] or ["0", "1", "2"]
-    top_p2 = [d for d, _ in p2_counts.most_common(3)] or ["0", "1", "2"]
-    top_p3 = [d for d, _ in p3_counts.most_common(3)] or ["0", "1", "2"]
-
-    # Form top combinatorial triplets
-    projected_triplets = []
-    for h in top_p1:
-        for t in top_p2:
-            for u in top_p3:
-                score = p1_counts.get(h, 0) + p2_counts.get(t, 0) + p3_counts.get(u, 0)
-                projected_triplets.append((f"{h}{t}{u}", score))
-
-    projected_triplets.sort(key=lambda x: x[1], reverse=True)
-
-    # Calculate overall most frequent 3-digit numbers across all suffix wins
-    all_suffixes = []
-    for r in rows:
-        if r[1]:
-            all_suffixes.extend(r[1].split(","))
-    suffix_counts = Counter(all_suffixes).most_common(5)
-
-    return {
-        "sample_size": len(fp_trio_list),
-        "hot_combinations": [item[0] for item in projected_triplets[:5]],
-        "hot_suffixes": [num for num, _ in suffix_counts],
-        "positional_distribution": {
-            "hundreds": dict(sorted(p1_counts.items())),
-            "tens": dict(sorted(p2_counts.items())),
-            "units": dict(sorted(p3_counts.items()))
-        }
+    metrics = compute_3digit_metrics() or {
+        "sample_size": 0,
+        "hot_combinations": [],
+        "hot_suffixes": [],
+        "positional_distribution": {"hundreds": {}, "tens": {}, "units": {}}
     }
+
+    return templates.TemplateResponse("index.html", {
+        "request": request,
+        "recent_draws": recent_draws,
+        "metrics": metrics
+    })
+
+@app.get("/api/results")
+def api_get_results():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT draw_name, draw_code, draw_date, first_prize, last_three_first_prize FROM draws ORDER BY id DESC LIMIT 50")
+        rows = cur.fetchall()
+        data = [{"name": r[0], "code": r[1], "date": r[2], "first_prize": r[3], "last_3": r[4]} for r in rows]
+    except Exception:
+        data = []
+    finally:
+        conn.close()
+    return data
+
+@app.get("/api/predict")
+def api_get_prediction():
+    metrics = compute_3digit_metrics()
+    if not metrics:
+        return {"status": "loading", "message": "Scraper is ingesting draws in background. Refresh in 30 seconds."}
+    return metrics
+
+@app.post("/api/sync")
+def api_trigger_scraper():
+    threading.Thread(target=run_scraper, daemon=True).start()
+    return {"status": "started", "message": "Scraper job dispatched in background"}
